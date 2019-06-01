@@ -118,6 +118,14 @@ broadcast Server{..} msg = do
 	clientMap <- readTVar clients
 	mapM_ (\client -> sendMessage client msg) (Map.elems clientMap)
 
+
+-- broadcast a message to all clients but the sender
+broadcastExcludeSender :: Server -> ClientName -> Message -> STM ()
+broadcastExcludeSender Server{..} who msg = do
+	clientMap <- readTVar clients
+	mapM_ (\client@Client{..} -> unless (clientName == who) $ sendMessage client msg) (Map.elems clientMap)
+
+
 ------------------------------------------------------------
 
 validateAndAddClient :: Server -> ClientName -> Handle -> IO (Maybe Client)
@@ -131,12 +139,12 @@ validateAndAddClient server@Server{..} clientName handle = atomically $ do
 			broadcast server $ Notice (clientName ++ " joined")
 			return (Just client)
 
-removeClient :: Server -> ClientName -> IO ()
-removeClient server@Server{..} clientName = atomically $ do
-	modifyTVar' clients $ Map.delete clientName
-	broadcast server $ Notice (clientName ++ " left")
-
-
+removeClient :: Server -> Client -> IO ()
+removeClient server@Server{..} client@Client{..} = do
+	atomically $ modifyTVar' clients $ Map.delete clientName
+	clientChannelsMap <- atomically $ readTVar clientChannels
+	mapM_ (\channelName -> leaveChannel server client channelName) $ Map.keys clientChannelsMap
+	atomically $ broadcast server $ Notice (clientName ++ " left")
 
 -- Talk to the client
 talk :: Handle -> Server -> IO ()
@@ -157,7 +165,7 @@ talk handle server@Server{..} = do
   							hPutStrLn handle "Name already in use. Please enter another name."
   							readName
   						Just client -> do
-  							runClient server client `finally` removeClient server name
+  							runClient server client `finally` removeClient server client
 
 runClient :: Server -> Client -> IO ()
 runClient srv@Server{..} client@Client{..} = do
@@ -171,8 +179,12 @@ receiveCommandsFromClient client@Client{..} = forever $ do
 
 server :: Server -> Client -> IO ()
 server srv@Server{..} client@Client{..} = do
-	clientChannelsMap <- atomically $ readTVar clientChannels
-	msg <- atomically $ foldr (orElse . readTChan) retry (clientSendChan : Map.elems clientChannelsMap)
+	-- try to read from all client channels, retry if there is no message
+	msg <- atomically $ do 
+		clientChannelsMap <- readTVar clientChannels
+		foldr (orElse . readTChan) retry (clientSendChan : Map.elems clientChannelsMap)
+	
+	-- handle the message
 	continue <- handleMessage srv client msg
 	when continue $ server srv client
 
@@ -223,7 +235,7 @@ handleMessage srv@Server{..} client@Client{..} message =
 					hPutStrLn clientHandle $ "Unrecognized command: " ++ msg
 					return True
 				_ -> do
-					atomically $ broadcast srv $ TellAll clientName msg
+					atomically $ broadcastExcludeSender srv clientName $ TellAll clientName msg
 					return True
 	where
 		output s = do hPutStrLn clientHandle s; return True
@@ -265,38 +277,39 @@ tellChannel srv@Server{..} client@Client{..} channelName msg = do
 		case Map.lookup channelName channelMap of
 			Nothing -> return False
 			Just (channel@Channel{..}) -> do
-				sendMessageToChannel channel (TellChan channelName clientName msg)
-				return True
+				clientChannelsMap <- readTVar clientChannels
+				case Map.lookup channelName clientChannelsMap of
+					Nothing -> return False
+					Just _ -> do 
+						sendMessageToChannel channel (TellChan channelName clientName msg)
+						return True
 	if ok
 		then return ()
-		else hPutStrLn clientHandle "Channel does not exist"
+		else hPutStrLn clientHandle "Channel does not exist or you are not a member"
 
 
 joinChannel :: Server -> Client -> ChannelName -> IO ()
 joinChannel srv@Server{..} client@Client{..} channelName = do
 	-- check if client already is in channel
 	clientChannelsMap <- atomically $ readTVar clientChannels
-	hPutStrLn clientHandle "[DEBUG] Check if you are already in channel"
 	unless (Map.member channelName clientChannelsMap) $ do
 		-- check if channel already exists
 		serverChannelsMap <- atomically $ readTVar serverChannels
 		channel@Channel{..} <- case Map.lookup channelName serverChannelsMap of
-			Just (channel@Channel {..}) -> do
-				hPutStrLn clientHandle "[DEBUG] Channel already exists, adding you to it"
+			Just (channel@Channel {..}) -> atomically $ do
 				-- channel found, add client to it
-				atomically $ modifyTVar' channelClients $ Set.insert clientName
+				modifyTVar' channelClients $ Set.insert clientName
 				return channel
-			Nothing -> do
+			Nothing -> atomically $ do
 				-- channel not found, create it
-				hPutStrLn clientHandle "[DEBUG] Channel does not exist, creating it.."
-				channel <- atomically $ newChannel channelName $ Set.singleton clientName
-				atomically $ modifyTVar' serverChannels $ Map.insert channelName channel
+				channel <- newChannel channelName $ Set.singleton clientName
+				modifyTVar' serverChannels $ Map.insert channelName channel
 				return channel
-		
-		clientChannel <- atomically $ dupTChan channelTChan
-		hPutStrLn clientHandle $ "[DEBUG] channel = " ++ channelName ++ " client = " ++ clientName
-		atomically $ modifyTVar' clientChannels $ Map.insert channelName clientChannel
-		atomically $ sendMessageToChannel channel (Joined channelName clientName)
+
+		atomically $ do
+			clientChannel <- dupTChan channelTChan
+			modifyTVar' clientChannels $ Map.insert channelName clientChannel
+			sendMessageToChannel channel (Joined channelName clientName)
 
 
 leaveChannel :: Server -> Client -> ChannelName -> IO ()
