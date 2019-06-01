@@ -97,6 +97,7 @@ data Message =
 	Notice String | -- message from server
 	Tell ClientName String | -- private message from other cleint
 	TellAll ClientName String | -- public message from other client
+	TellChan ChannelName ClientName String | -- message to a channel
 	Joined ChannelName String | -- message to a channel
 	Departed ChannelName String | -- message to a channel
 	Members ChannelName (Set.Set ClientName) | -- message to a channel
@@ -107,30 +108,15 @@ sendMessage :: Client -> Message -> STM ()
 sendMessage Client{..} msg = do 
 	writeTChan clientSendChan msg
 
+-- send message to a channel
+sendMessageToChannel :: Channel -> Message -> STM ()
+sendMessageToChannel Channel{..} msg = writeTChan channelTChan msg
+
 -- broadcast a message to all clients
 broadcast :: Server -> Message -> STM ()
 broadcast Server{..} msg = do
 	clientMap <- readTVar clients
 	mapM_ (\client -> sendMessage client msg) (Map.elems clientMap)
-
--- a client sends a message to another client
-tell :: Server -> Client -> ClientName -> String -> IO ()
-tell srv@Server{..} client@Client{..} receiverName msg = do
-	ok <- atomically $ do
-		clientMap <- readTVar clients
-		case Map.lookup receiverName clientMap of
-			Nothing -> return False
-			Just receiver -> do 
-				sendMessage receiver (Tell clientName msg)
-				return True
-	if ok
-		then return ()
-		else hPutStrLn clientHandle (receiverName ++ " is not connected")
-
-sendMessageToChannel :: Channel -> Message -> STM ()
-sendMessageToChannel Channel{..} msg = writeTChan channelTChan msg
-
-
 
 ------------------------------------------------------------
 
@@ -175,34 +161,33 @@ talk handle server@Server{..} = do
 
 runClient :: Server -> Client -> IO ()
 runClient srv@Server{..} client@Client{..} = do
-	race (server srv client) (receive client)
+	race (server srv client) (receiveCommandsFromClient client)
 	return ()
 
-receive :: Client -> IO ()
-receive client@Client{..} = forever $ do 
+receiveCommandsFromClient :: Client -> IO ()
+receiveCommandsFromClient client@Client{..} = forever $ do 
 	msg <- hGetLine clientHandle
 	atomically $ sendMessage client (Command msg)
 
 server :: Server -> Client -> IO ()
-server srv@Server{..} client@Client{..} = join $ atomically $ do
-	kicked <- readTVar clientKicked
-	case kicked of
-		Just reason -> return $ hPutStrLn clientHandle $
-			"You have been kicked for: " ++ reason
-		Nothing -> do
-			msg <- readTChan clientSendChan
-			return $ do
-				continue <- handleMessage srv client msg
-				when continue $ server srv client
+server srv@Server{..} client@Client{..} = do
+	clientChannelsMap <- atomically $ readTVar clientChannels
+	msg <- atomically $ foldr (orElse . readTChan) retry (clientSendChan : Map.elems clientChannelsMap)
+	continue <- handleMessage srv client msg
+	when continue $ server srv client
 
 handleMessage :: Server -> Client -> Message -> IO Bool
 handleMessage srv@Server{..} client@Client{..} message =
 	case message of
+		-- messages from connected client or other client threads
+
 		Notice msg -> output $ "!! " ++ msg ++ " !!"
 
 		Tell senderName msg -> output $ "*" ++ senderName ++"*: " ++ msg
 
 		TellAll senderName msg -> output $ "<" ++ senderName ++">: " ++ msg
+
+		TellChan chanName senderName msg -> output $ "[" ++ chanName ++ "]" ++ "<" ++ senderName ++ ">: " ++ msg
 
 		Joined channelName who -> output $ who ++ " JOINED CHANNEL " ++ channelName
 
@@ -218,6 +203,9 @@ handleMessage srv@Server{..} client@Client{..} message =
 				-- 	return True
 				"/tell" : receiver : what -> do
 					tell srv client receiver (unwords what)
+					return True
+				"/tellChan" : channelName : what -> do
+					tellChannel srv client channelName (unwords what)
 					return True
 				"/join" : channelName -> do
 					joinChannel srv client (unwords channelName)
@@ -252,6 +240,36 @@ handleMessage srv@Server{..} client@Client{..} message =
 			if ok 
 				then return ()
 				else hPutStrLn clientHandle "Channel does not exist"
+
+
+-- a client sends a message to another client
+tell :: Server -> Client -> ClientName -> String -> IO ()
+tell srv@Server{..} client@Client{..} receiverName msg = do
+	ok <- atomically $ do
+		clientMap <- readTVar clients
+		case Map.lookup receiverName clientMap of
+			Nothing -> return False
+			Just receiver -> do 
+				sendMessage receiver (Tell clientName msg)
+				return True
+	if ok
+		then return ()
+		else hPutStrLn clientHandle (receiverName ++ " is not connected")
+
+-- a client sends a message to a channel
+tellChannel :: Server -> Client -> ChannelName -> String -> IO ()
+tellChannel srv@Server{..} client@Client{..} channelName msg = do
+	ok <- atomically $ do
+		-- check that channel exists
+		channelMap <- readTVar serverChannels
+		case Map.lookup channelName channelMap of
+			Nothing -> return False
+			Just (channel@Channel{..}) -> do
+				sendMessageToChannel channel (TellChan channelName clientName msg)
+				return True
+	if ok
+		then return ()
+		else hPutStrLn clientHandle "Channel does not exist"
 
 
 joinChannel :: Server -> Client -> ChannelName -> IO ()
