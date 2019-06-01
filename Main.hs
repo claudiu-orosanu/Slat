@@ -13,7 +13,9 @@ import System.IO (Handle, hSetBuffering, BufferMode(..), hGetLine, hClose, hPutS
 import Control.Exception (finally)
 
 import qualified Data.Map as Map
+import qualified Data.Set as Set
 import Data.Map (Map)
+import Data.Set (Set)
 
 port = 2233 :: Int
 
@@ -34,56 +36,106 @@ main = withSocketsDo $ do
 ------- Client Data -------
 
 type ClientName = String
+type ChannelName = String
 
 data Client = Client {
 	clientName :: ClientName,
 	clientHandle :: Handle,
 	clientKicked :: TVar (Maybe String),
-	clientSendChan :: TChan Message
+	clientSendChan :: TChan Message,
+	clientChannels :: TVar (Map.Map ChannelName (TChan Message))
 }
 
-data Message =
-	Notice String | -- message from server
-	Tell ClientName String | -- private message from other cleint
-	Broadcast ClientName String | -- public message from other client
-	Command String -- command sent by client 
-
+data Channel = Channel { 
+	channelName  :: ChannelName,
+    channelClients :: TVar (Set ClientName),
+    channelTChan  :: TChan Message
+}
 
 newClient :: ClientName -> Handle -> STM Client
 newClient name handle = do
 	kicked <- newTVar Nothing
 	chan <- newTChan
+	clientChannels <- newTVar Map.empty
 	return Client {
 		clientName = name,
 		clientHandle = handle,
 		clientKicked = kicked,
-		clientSendChan = chan
+		clientSendChan = chan,
+		clientChannels = clientChannels
 	}
 
-sendMessage :: Client -> Message -> STM ()
-sendMessage Client{..} msg = do 
-	writeTChan clientSendChan msg
+newChannel :: ChannelName -> Set ClientName -> STM Channel
+newChannel name clients = do
+	clients <- newTVar clients
+	chan <- newBroadcastTChan
+	return Channel {
+		channelName = name,
+		channelClients = clients,
+		channelTChan = chan
+	}
 
 ------- Server Data -------
 
 data Server = Server {
-	clients :: TVar (Map ClientName Client)
+	clients :: TVar (Map ClientName Client),
+	serverChannels :: TVar (Map ChannelName Channel)
 }
 
 newServer :: IO Server
 newServer = do
-	c <- newTVarIO Map.empty
-	return Server { clients = c }
+	clients <- newTVarIO Map.empty
+	channels <- newTVarIO Map.empty
+	return Server { 
+		clients = clients,
+		serverChannels = channels
+	}
 
+------- Messages -------
+
+data Message =
+	Notice String | -- message from server
+	Tell ClientName String | -- private message from other cleint
+	TellAll ClientName String | -- public message from other client
+	Joined ChannelName String | -- message to a channel
+	Departed ChannelName String | -- message to a channel
+	Members ChannelName (Set.Set ClientName) | -- message to a channel
+	Command String -- command sent by client 
+
+-- send message to a client
+sendMessage :: Client -> Message -> STM ()
+sendMessage Client{..} msg = do 
+	writeTChan clientSendChan msg
+
+-- broadcast a message to all clients
 broadcast :: Server -> Message -> STM ()
 broadcast Server{..} msg = do
 	clientMap <- readTVar clients
 	mapM_ (\client -> sendMessage client msg) (Map.elems clientMap)
 
+-- a client sends a message to another client
+tell :: Server -> Client -> ClientName -> String -> IO ()
+tell srv@Server{..} client@Client{..} receiverName msg = do
+	ok <- atomically $ do
+		clientMap <- readTVar clients
+		case Map.lookup receiverName clientMap of
+			Nothing -> return False
+			Just receiver -> do 
+				sendMessage receiver (Tell clientName msg)
+				return True
+	if ok
+		then return ()
+		else hPutStrLn clientHandle (receiverName ++ " is not connected")
+
+sendMessageToChannel :: Channel -> Message -> STM ()
+sendMessageToChannel Channel{..} msg = writeTChan channelTChan msg
+
+
+
 ------------------------------------------------------------
 
-validateAddClient :: Server -> ClientName -> Handle -> IO (Maybe Client)
-validateAddClient server@Server{..} clientName handle = atomically $ do
+validateAndAddClient :: Server -> ClientName -> Handle -> IO (Maybe Client)
+validateAndAddClient server@Server{..} clientName handle = atomically $ do
 	clientMap <- readTVar clients
 	if Map.member clientName clientMap
 		then return Nothing
@@ -98,19 +150,6 @@ removeClient server@Server{..} clientName = atomically $ do
 	modifyTVar' clients $ Map.delete clientName
 	broadcast server $ Notice (clientName ++ " left")
 
-sendTo :: Server -> ClientName -> Message -> STM Bool
-sendTo srv@Server{..} clientName msg = do
-	clientMap <- readTVar clients
-	case Map.lookup clientName clientMap of
-		Nothing -> return False
-		Just client -> sendMessage client msg >> return True
-
-tell :: Server -> Client -> ClientName -> String -> IO ()
-tell srv@Server{..} client@Client{..} who msg = do
-	ok <- atomically $ sendTo srv who (Tell clientName msg)
-	if ok
-		then return ()
-		else hPutStrLn clientHandle (who ++ " is not connected")
 
 
 -- Talk to the client
@@ -126,7 +165,7 @@ talk handle server@Server{..} = do
   			if null name
   				then readName
   				else do
-  					ok <- validateAddClient server name handle
+  					ok <- validateAndAddClient server name handle
   					case ok of 
   						Nothing -> do
   							hPutStrLn handle "Name already in use. Please enter another name."
@@ -160,15 +199,34 @@ handleMessage :: Server -> Client -> Message -> IO Bool
 handleMessage srv@Server{..} client@Client{..} message =
 	case message of
 		Notice msg -> output $ "!! " ++ msg ++ " !!"
-		Tell name msg -> output $ "*" ++ name ++"*: " ++ msg
-		Broadcast name msg -> output $ "<" ++ name ++">: " ++ msg
+
+		Tell senderName msg -> output $ "*" ++ senderName ++"*: " ++ msg
+
+		TellAll senderName msg -> output $ "<" ++ senderName ++">: " ++ msg
+
+		Joined channelName who -> output $ who ++ " JOINED CHANNEL " ++ channelName
+
+		Departed channelName who -> output $ who ++ " LEFT CHANNEL " ++ channelName
+
+		Members channelName members -> output $ 
+			printf "Members of %s:  %s" channelName . unwords . Set.toList $ members
+
 		Command msg ->
 			case words msg of
 				-- ["/kick", who] -> do
 				-- 	atomically $ kick server who clientName
 				-- 	return True
-				"/tell" : who : what -> do
-					tell srv client who (unwords what)
+				"/tell" : receiver : what -> do
+					tell srv client receiver (unwords what)
+					return True
+				"/join" : channelName -> do
+					joinChannel srv client (unwords channelName)
+					return True
+				"/leave" : channelName -> do
+					leaveChannel srv client (unwords channelName)
+					return True
+				"/members" : channelName -> do 
+					getMembers (unwords channelName)
 					return True
 				["/quit"] -> do
 					hPutStrLn clientHandle "Thank you for using Slat!"
@@ -177,8 +235,71 @@ handleMessage srv@Server{..} client@Client{..} message =
 					hPutStrLn clientHandle $ "Unrecognized command: " ++ msg
 					return True
 				_ -> do
-					atomically $ broadcast srv $ Broadcast clientName msg
+					atomically $ broadcast srv $ TellAll clientName msg
 					return True
 	where
 		output s = do hPutStrLn clientHandle s; return True
 
+		getMembers channelName = do
+			ok <- atomically $ do
+				serverChannelsMap <- readTVar serverChannels
+				case Map.lookup channelName serverChannelsMap of
+					Nothing -> return False
+					Just (Channel{..}) -> do
+						channelClientsSet <- readTVar channelClients
+						sendMessage client (Members channelName channelClientsSet)
+						return True
+			if ok 
+				then return ()
+				else hPutStrLn clientHandle "Channel does not exist"
+
+
+joinChannel :: Server -> Client -> ChannelName -> IO ()
+joinChannel srv@Server{..} client@Client{..} channelName = do
+	-- check if client already is in channel
+	clientChannelsMap <- atomically $ readTVar clientChannels
+	hPutStrLn clientHandle "[DEBUG] Check if you are already in channel"
+	unless (Map.member channelName clientChannelsMap) $ do
+		-- check if channel already exists
+		serverChannelsMap <- atomically $ readTVar serverChannels
+		channel@Channel{..} <- case Map.lookup channelName serverChannelsMap of
+			Just (channel@Channel {..}) -> do
+				hPutStrLn clientHandle "[DEBUG] Channel already exists, adding you to it"
+				-- channel found, add client to it
+				atomically $ modifyTVar' channelClients $ Set.insert clientName
+				return channel
+			Nothing -> do
+				-- channel not found, create it
+				hPutStrLn clientHandle "[DEBUG] Channel does not exist, creating it.."
+				channel <- atomically $ newChannel channelName $ Set.singleton clientName
+				atomically $ modifyTVar' serverChannels $ Map.insert channelName channel
+				return channel
+		
+		clientChannel <- atomically $ dupTChan channelTChan
+		hPutStrLn clientHandle $ "[DEBUG] channel = " ++ channelName ++ " client = " ++ clientName
+		atomically $ modifyTVar' clientChannels $ Map.insert channelName clientChannel
+		atomically $ sendMessageToChannel channel (Joined channelName clientName)
+
+
+leaveChannel :: Server -> Client -> ChannelName -> IO ()
+leaveChannel srv@Server{..} client@Client{..} channelName = do
+	-- check if channel already exists
+	ok <- atomically $ do
+		serverChannelsMap <- readTVar serverChannels
+		case Map.lookup channelName serverChannelsMap of
+			Nothing -> return False
+			Just (channel@Channel{..}) -> do
+				-- delete client from channel
+				modifyTVar' channelClients $ Set.delete clientName
+				channelClientsSet <- readTVar channelClients
+				when (Set.null channelClientsSet) $
+					-- last user in channel, delete channel from server
+					modifyTVar' serverChannels $ Map.delete channelName
+				-- delete channel from client channels
+				modifyTVar' clientChannels $ Map.delete channelName
+				-- notify clients in channel that client has left
+				sendMessageToChannel channel (Departed channelName clientName)
+				return True
+	if ok
+		then return ()
+		else hPutStrLn clientHandle "You cannot leave a channel that does not exist"
