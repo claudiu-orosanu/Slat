@@ -32,8 +32,6 @@ main = withSocketsDo $ do
 
 --------------- Data types ---------------
 
-------- Client Data -------
-
 type ClientName = String
 type ChannelName = String
 
